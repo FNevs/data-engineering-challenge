@@ -1,0 +1,15 @@
+# Leitura dos arquivos .parquet.gz do dataset NYC TLC.
+pandas==2.2.2
+pyarrow==16.1.0
+
+# Driver Postgres. A carga em massa usa COPY FROM STDIN via psycopg2 em vez de
+# pandas.to_sql: alem de ser uma ordem de grandeza mais rapido para os ~39M
+# registros, contorna uma incompatibilidade real de versoes. O pandas 2.2 exige
+# SQLAlchemy >= 2.0, enquanto o Airflow 2.9 fixa SQLAlchemy < 2.0; nesse cenario
+# o pandas ignora o SQLAlchemy silenciosamente e falha ao tratar o Engine como
+# conexao DBAPI. A versao abaixo acompanha a que o Airflow ja instala.
+psycopg2-binary==2.9.9
+SQLAlchemy==1.4.52
+
+# Download dos arquivos do repositorio do desafio.
+requests==2.32.3

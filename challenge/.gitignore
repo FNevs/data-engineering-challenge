@@ -1,0 +1,26 @@
+# Dados baixados: ~7 GB de parquet, reconstruidos pela DAG a partir da origem.
+data/*
+!data/.gitkeep
+
+# Logs do Airflow
+logs/*
+!logs/.gitkeep
+
+# Plugins (diretorio vazio, mantido pela estrutura do Airflow)
+plugins/*
+!plugins/.gitkeep
+
+# Credenciais. O .env deste projeto contem apenas senhas locais de
+# desenvolvimento, mas versiona-lo seria um mau habito a carregar adiante.
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ruff_cache/
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
