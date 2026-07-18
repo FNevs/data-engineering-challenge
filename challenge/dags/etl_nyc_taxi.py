@@ -19,7 +19,7 @@ import logging
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Final, List
+from typing import Final
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -38,7 +38,7 @@ BASE_URL: Final[str] = (
     "data-engineering-challenge/master/nyc-tlc-data"
 )
 ANO_REFERENCIA: Final[int] = 2022
-MESES: Final[List[int]] = list(range(1, 13))
+MESES: Final[list[int]] = list(range(1, 13))
 DIRETORIO_DADOS: Final[Path] = Path("/opt/airflow/data")
 CONEXAO_WAREHOUSE: Final[str] = "warehouse"
 
@@ -154,7 +154,7 @@ def carregar_parquet_em_raw(caminho_parquet: str) -> int:
             # arquivo inteiro: os meses maiores passam de 3,5M linhas e
             # carregar tudo de uma vez pressionaria a memoria do container.
             leitor = pq.ParquetFile(arquivo)
-            colunas_destino = list(MAPA_COLUNAS.values()) + ["arquivo_origem"]
+            colunas_destino = [*MAPA_COLUNAS.values(), "arquivo_origem"]
             comando_copy = (
                 f"COPY raw.yellow_tripdata ({', '.join(colunas_destino)}) "
                 "FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '\\N')"
@@ -324,14 +324,15 @@ def etl_nyc_taxi() -> None:
 
         if assinatura[:2] == b"\x1f\x8b":
             logger.info("Arquivo gzip detectado, descomprimindo %s", destino_gz.name)
-            with gzip.open(destino_gz, "rb") as origem:
-                with destino_parquet.open("wb") as saida:
-                    shutil.copyfileobj(origem, saida)
+            with (
+                gzip.open(destino_gz, "rb") as origem,
+                destino_parquet.open("wb") as saida,
+            ):
+                shutil.copyfileobj(origem, saida)
             destino_gz.unlink()
         elif assinatura == b"PAR1":
             logger.info(
-                "Arquivo ja e Parquet puro apesar da extensao .gz; "
-                "renomeando %s",
+                "Arquivo ja e Parquet puro apesar da extensao .gz; renomeando %s",
                 destino_gz.name,
             )
             destino_gz.rename(destino_parquet)
@@ -367,12 +368,12 @@ def etl_nyc_taxi() -> None:
         return carregar_parquet_em_raw(caminho_parquet)
 
     @task(task_id="construir_camada_trusted")
-    def construir_camada_trusted(contagens: List[int]) -> int:
+    def construir_camada_trusted(contagens: list[int]) -> int:
         """Constroi a camada trusted a partir da raw, aplicando as validacoes.
 
         Parameters
         ----------
-        contagens : List[int]
+        contagens : list[int]
             Quantidade de linhas carregada por cada task de carga raw. Serve
             para materializar a dependencia entre as etapas e para registrar o
             total ingerido em log.
@@ -388,9 +389,7 @@ def etl_nyc_taxi() -> None:
         _executar_sql("/opt/airflow/sql/03_trusted.sql")
 
         hook = PostgresHook(postgres_conn_id=CONEXAO_WAREHOUSE)
-        total_trusted = hook.get_first(
-            "SELECT COUNT(*) FROM trusted.viagens"
-        )[0]
+        total_trusted = hook.get_first("SELECT COUNT(*) FROM trusted.viagens")[0]
 
         descartados = total_raw - total_trusted
         percentual = (descartados / total_raw * 100) if total_raw else 0.0

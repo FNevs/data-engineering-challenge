@@ -11,12 +11,27 @@
 
 DROP TABLE IF EXISTS trusted.viagens;
 
+-- Eleva os limites de memoria para esta sessao. A construcao da trusted varre
+-- ~39M linhas e cria tres indices; com o work_mem padrao a ordenacao dos
+-- indices derrama para disco sem necessidade.
+--
+-- Usa SET e nao SET LOCAL: este arquivo roda tanto via psql (autocommit, onde
+-- SET LOCAL nao teria efeito e apenas emitiria warning) quanto via PostgresHook.
+SET work_mem = '256MB';
+SET maintenance_work_mem = '1GB';
+
 CREATE TABLE trusted.viagens AS
 SELECT
     -- Chave sintetica: o dataset de origem nao possui identificador de viagem.
-    ROW_NUMBER() OVER (
-        ORDER BY tpep_pickup_datetime, pu_location_id, do_location_id
-    )                                              AS viagem_id,
+    --
+    -- Sem ORDER BY de proposito. A versao anterior usava
+    -- ROW_NUMBER() OVER (ORDER BY tpep_pickup_datetime, ...), o que forcava a
+    -- ordenacao completa das ~39M linhas: ~2,5 GB de arquivos temporarios e
+    -- varios minutos de merge externo, medidos em execucao. O unico ganho era
+    -- ter ids correlacionados com a linha do tempo, o que nenhuma consulta
+    -- deste projeto utiliza — a ordenacao cronologica sai de datahora_inicio,
+    -- que e indexada. A unicidade da chave e preservada.
+    ROW_NUMBER() OVER ()                           AS viagem_id,
 
     vendor_id::SMALLINT                            AS vendor_id,
     tpep_pickup_datetime                           AS datahora_inicio,

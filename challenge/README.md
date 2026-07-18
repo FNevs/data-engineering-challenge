@@ -20,19 +20,45 @@ organizados em três camadas de processamento.
 
 ## Arquitetura
 
-```
-   GitHub (datarisk-io)                    Docker Compose
-  ┌─────────────────────┐   ┌──────────────────────────────────────────┐
-  │ 12 arquivos .parquet│   │  airflow-webserver   ──┐                 │
-  │ yellow_tripdata     │──▶│  airflow-scheduler   ──┼─▶ postgres      │
-  │ 2022-01 … 2022-12   │   │   (LocalExecutor)      │   (metadados)   │
-  └─────────────────────┘   │                        │                 │
-                            │                        └─▶ postgres      │
-                            │                            (warehouse)   │
-                            │                             ├── raw      │
-                            │                             ├── trusted  │
-                            │                             └── refined  │
-                            └──────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph origem["Origem — GitHub datarisk-io"]
+        arquivos[("12 arquivos Parquet<br/>yellow_tripdata<br/>2022-01 … 2022-12<br/>~587 MB")]
+    end
+
+    subgraph docker["Docker Compose"]
+        direction TB
+
+        subgraph orq["Orquestração"]
+            web["airflow-webserver<br/><small>UI :8080</small>"]
+            sched["airflow-scheduler<br/><small>LocalExecutor</small>"]
+        end
+
+        meta[("postgres-airflow<br/><small>metadados</small>")]
+
+        subgraph wh["postgres-warehouse :5433"]
+            direction TB
+            raw["<b>raw</b><br/><small>cópia fiel<br/>sem transformação</small>"]
+            trusted["<b>trusted</b><br/><small>limpo, tipado<br/>e validado</small>"]
+            refined["<b>refined</b><br/><small>agregações<br/>das questões</small>"]
+            raw --> trusted --> refined
+        end
+    end
+
+    arquivos -->|"extração HTTP"| sched
+    sched -->|"COPY FROM STDIN"| raw
+    sched -.->|"estado das DAGs"| meta
+    web <-.-> meta
+
+    classDef fonte fill:#e8f0fe,stroke:#4285f4,stroke-width:2px,color:#1a1a1a
+    classDef camada fill:#e6f4ea,stroke:#34a853,stroke-width:2px,color:#1a1a1a
+    classDef servico fill:#fef7e0,stroke:#fbbc04,stroke-width:2px,color:#1a1a1a
+    classDef banco fill:#fce8e6,stroke:#ea4335,stroke-width:2px,color:#1a1a1a
+
+    class arquivos fonte
+    class raw,trusted,refined camada
+    class web,sched servico
+    class meta banco
 ```
 
 Quatro containers no total. Dois bancos PostgreSQL separados, deliberadamente:
@@ -98,20 +124,28 @@ docker compose exec postgres-warehouse \
 
 A DAG `etl_nyc_taxi` tem quatro etapas:
 
-```
-criar_camada_raw
-       │
-       ▼
-extrair_arquivo  ×12  (dynamic task mapping)
-       │
-       ▼
-carregar_raw     ×12  (dynamic task mapping)
-       │
-       ▼
-construir_camada_trusted
-       │
-       ▼
-construir_camada_refined
+```mermaid
+flowchart TD
+    A["criar_camada_raw<br/><small>DDL da tabela</small>"]
+
+    subgraph map["dynamic task mapping — uma task por mês"]
+        direction LR
+        E1["extrair_arquivo<br/>2022-01"] --> C1["carregar_raw<br/>2022-01"]
+        E2["extrair_arquivo<br/>2022-02"] --> C2["carregar_raw<br/>2022-02"]
+        E3["…"] --> C3["…"]
+        E12["extrair_arquivo<br/>2022-12"] --> C12["carregar_raw<br/>2022-12"]
+    end
+
+    T["construir_camada_trusted<br/><small>limpeza e validação</small>"]
+    R["construir_camada_refined<br/><small>agregações</small>"]
+
+    A --> E1 & E2 & E3 & E12
+    C1 & C2 & C3 & C12 --> T --> R
+
+    classDef etapa fill:#e8f0fe,stroke:#4285f4,color:#1a1a1a
+    classDef transf fill:#e6f4ea,stroke:#34a853,color:#1a1a1a
+    class A,E1,E2,E3,E12,C1,C2,C3,C12 etapa
+    class T,R transf
 ```
 
 As etapas de extração e carga usam **dynamic task mapping** (`.expand()`): o
@@ -164,19 +198,27 @@ um wrapper fino sobre ela. Lógica dentro do decorador só roda com um contexto 
 Airflow montado, o que torna qualquer teste caro. Como função de módulo, ela é
 importável e testável isoladamente.
 
-### Custo conhecido: a chave sintética da camada trusted
+### A chave sintética da camada trusted, e um sort que custou caro
 
-A `trusted.viagens` recebe um `viagem_id` gerado por
-`ROW_NUMBER() OVER (ORDER BY datahora_inicio, ...)`, já que o dataset de origem
-não traz identificador de viagem. O `ORDER BY` força a ordenação completa das
-~39 milhões de linhas, que não cabe em memória e derrama para disco — cerca de
-**2,5 GB de arquivos temporários** medidos durante a execução, e vários minutos
-de merge externo.
+O dataset de origem não traz identificador de viagem, então a `trusted.viagens`
+gera um `viagem_id` próprio. A primeira versão usava:
 
-O ganho é um identificador estável e ordenado cronologicamente. Se o tempo de
-construção passar a incomodar, trocar por `ROW_NUMBER() OVER ()` elimina a
-ordenação por completo e mantém a unicidade da chave — perde-se apenas a
-correlação entre a ordem do id e a linha do tempo.
+```sql
+ROW_NUMBER() OVER (ORDER BY tpep_pickup_datetime, pu_location_id, do_location_id)
+```
+
+O `ORDER BY` força a ordenação completa das ~39 milhões de linhas. Medido em
+execução: **2,5 GB de arquivos temporários** em disco e vários minutos de merge
+externo, com o processo consumindo mais de 5 GB de RAM. Numa máquina de 16 GB
+isso contribuiu para travar o host.
+
+A versão final usa `ROW_NUMBER() OVER ()`, sem ordenação. A chave continua única
+e estável; perde-se apenas a correlação entre a ordem do id e a linha do tempo —
+que nenhuma consulta deste projeto usa, já que a ordenação cronológica vem de
+`datahora_inicio`, que é indexada.
+
+A lição vale além deste projeto: `ORDER BY` dentro de uma window function sobre
+tabela grande é uma ordenação total disfarçada de detalhe cosmético.
 
 ### Critérios de limpeza da camada trusted
 
