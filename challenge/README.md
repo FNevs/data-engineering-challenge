@@ -260,7 +260,16 @@ administrador.
 
 ### DAG no Airflow
 
+Execução completa: **40 tasks concluídas com sucesso em 20 minutos e 29 segundos**
+(1 criação da raw + 12 extrações + 12 cargas raw + 1 criação da trusted + 12
+cargas trusted + 1 finalização + 1 refined).
+
 ![Execução da DAG no Airflow](docs/img/airflow-dag.png)
+
+O grafo do pipeline, com os grupos `[ ]` indicando as tasks geradas
+dinamicamente por mês:
+
+![Grafo da DAG](docs/img/airflow-graph.png)
 
 ### Camadas no PostgreSQL
 
