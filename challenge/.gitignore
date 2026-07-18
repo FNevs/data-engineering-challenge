@@ -24,3 +24,9 @@ venv/
 # Sistema operacional
 .DS_Store
 Thumbs.db
+
+# Configuracao local de ferramentas de editor/assistente. Nao faz parte da
+# entrega e nao deve ser versionada.
+.claude/
+.vscode/
+.idea/
