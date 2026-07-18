@@ -72,13 +72,23 @@ services:
       - ./sql/init:/docker-entrypoint-initdb.d
     command:
       # Tuning para carga em lote de ~39M linhas numa maquina de 16 GB.
+      #
+      # max_wal_size foi reduzido de 4GB para 1GB de proposito. O valor alto
+      # espacava os checkpoints e acelerava a ingestao, mas deixava ate 4 GB de
+      # WAL em disco entre eles. Somado ao crescimento das tabelas, isso ajudou
+      # a esgotar o disco e derrubar a maquina. Checkpoints mais frequentes
+      # custam um pouco de throughput e devolvem previsibilidade de espaco.
       - postgres
       - -c
-      - max_wal_size=4GB
+      - max_wal_size=1GB
       - -c
-      - checkpoint_timeout=15min
+      - min_wal_size=256MB
       - -c
-      - shared_buffers=1GB
+      - checkpoint_timeout=10min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - shared_buffers=768MB
       - -c
       - work_mem=64MB
       - -c

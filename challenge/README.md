@@ -245,12 +245,184 @@ de descarte é medida e registrada em log a cada execução.
 
 ---
 
+## Execução
+
+Registros da execução real do pipeline nesta máquina.
+
+### Containers em execução
+
+Os quatro serviços do `docker-compose` de pé: webserver e scheduler do Airflow,
+o Postgres de metadados e o Postgres do warehouse. O `airflow-init` aparece
+encerrado porque roda apenas uma vez, aplicando as migrações e criando o usuário
+administrador.
+
+![Containers no Docker Desktop](docs/img/docker-containers.png)
+
+### DAG no Airflow
+
+![Execução da DAG no Airflow](docs/img/airflow-dag.png)
+
+### Camadas no PostgreSQL
+
+![Schemas e volumetria no PostgreSQL](docs/img/postgres-camadas.png)
+
+### Respostas saindo do banco
+
+![Queries das questões no psql](docs/img/postgres-respostas.png)
+
+---
+
 ## Respostas às questões
 
 > Os números abaixo referem-se à camada `trusted` (dados validados), salvo onde
 > indicado. As queries completas estão em [`sql/05_respostas.sql`](sql/05_respostas.sql).
 
-_(preenchido após a execução)_
+### 1. Qual o total de registros na tabela final?
+
+## **38.681.625 registros**
+
+```sql
+SELECT COUNT(*) AS total_registros
+FROM trusted.viagens;
+```
+
+Contexto da limpeza:
+
+| Camada | Registros |
+|---|---:|
+| `raw` (ingestão fiel dos 12 arquivos) | 39.656.098 |
+| `trusted` (após validação) | **38.681.625** |
+| Descartados | 974.473 (**2,46%**) |
+
+Descartar 2,46% é um resultado saudável: agressivo o bastante para eliminar o
+lixo que distorceria as estatísticas, conservador o bastante para não jogar fora
+dados legítimos. Nenhum registro foi perdido — todos permanecem na camada `raw`.
+
+### 2. Qual o total de viagens iniciadas e finalizadas no dia 17 de junho?
+
+O enunciado admite mais de uma leitura, então as três foram calculadas para
+2022-06-17 (o dataset cobre apenas 2022):
+
+| Interpretação | Viagens |
+|---|---:|
+| Iniciadas no dia 17 | 122.113 |
+| Finalizadas no dia 17 | 121.878 |
+| **Iniciadas e finalizadas no dia 17** | **120.388** |
+
+A leitura mais literal do enunciado — "iniciadas **e** finalizadas" — é a
+terceira: **120.388 viagens**.
+
+```sql
+SELECT
+    COUNT(*) FILTER (WHERE data_inicio = DATE '2022-06-17') AS iniciadas,
+    COUNT(*) FILTER (WHERE data_fim    = DATE '2022-06-17') AS finalizadas,
+    COUNT(*) FILTER (
+        WHERE data_inicio = DATE '2022-06-17'
+          AND data_fim    = DATE '2022-06-17'
+    ) AS iniciadas_e_finalizadas_no_mesmo_dia
+FROM trusted.viagens
+WHERE data_inicio = DATE '2022-06-17'
+   OR data_fim    = DATE '2022-06-17';
+```
+
+A diferença entre os três números é coerente: 1.725 viagens começaram no dia 17
+e terminaram depois da meia-noite, e 1.490 vieram do dia 16.
+
+### 3. Qual foi o dia da viagem mais longa percorrida?
+
+## **13 de junho de 2022**
+
+| Campo | Valor |
+|---|---|
+| Data | 2022-06-13 |
+| Início | 01:36:18 |
+| Fim | 08:21:44 |
+| Distância | 380,13 milhas (611,76 km) |
+| Duração | 405,43 min (6h45) |
+| Velocidade média | 56,3 mph |
+| Valor pago | US$ 305,60 |
+
+```sql
+SELECT data_inicio AS dia, distancia_milhas, distancia_km,
+       duracao_minutos, valor_total
+FROM trusted.viagens
+ORDER BY distancia_milhas DESC
+LIMIT 1;
+```
+
+**Esta resposta exigiu um filtro adicional, e vale explicar o porquê.**
+
+Com apenas os filtros de distância e duração, a "viagem mais longa" era de
+**991,59 milhas percorridas em 26 minutos** — 2.288 mph. O topo inteiro da
+distribuição era assim:
+
+| Distância | Duração | Velocidade implícita | Valor pago |
+|---:|---:|---:|---:|
+| 991,59 mi | 26 min | 2.288 mph | US$ 25,67 |
+| 975,86 mi | 21 min | 2.788 mph | US$ 30,10 |
+| 811,76 mi | 9,95 min | 4.895 mph | US$ 15,36 |
+| 749,49 mi | 1,18 min | 38.110 mph | US$ 11,85 |
+
+O valor pago denuncia o defeito: **US$ 25,67 por 991 milhas**, quando uma
+corrida real dessa distância custaria alguns milhares de dólares. São erros de
+hodômetro, não corridas.
+
+O erro estava em tratar distância e duração como critérios **independentes**.
+Cada valor isolado é plausível — 991 milhas existe, 26 minutos existe. O que é
+impossível é a combinação. Daí o critério ser a **razão** entre eles: velocidade
+média de no máximo 100 mph, generosa o bastante para preservar viagens
+legítimas por rodovia, cuja média observada fica entre 45 e 65 mph.
+
+Pela interpretação alternativa de "mais longa" como **maior duração**, a
+resposta é **14 de julho de 2022**, com 1.439,97 minutos. Vale a ressalva de
+que esse valor encosta no teto de 24 horas imposto pelo filtro (6) — ou seja, é
+um valor truncado pelo próprio critério de limpeza, e não um máximo natural dos
+dados.
+
+### 4. Qual a média, o desvio padrão, o mínimo, o máximo e os quartis da distribuição de distância percorrida nas viagens totais?
+
+Sobre as 38.681.625 viagens da camada `trusted`:
+
+| Estatística | Milhas | Quilômetros |
+|---|---:|---:|
+| Média | 3,5666 | 5,7398 |
+| Desvio padrão | 4,4914 | 7,2282 |
+| Mínimo | 0,01 | 0,02 |
+| **Q1** (25%) | 1,15 | 1,85 |
+| **Mediana** (50%) | 1,91 | 3,07 |
+| **Q3** (75%) | 3,60 | 5,79 |
+| Máximo | 380,13 | 611,76 |
+
+```sql
+SELECT
+    COUNT(*)                                    AS qtd_viagens,
+    ROUND(AVG(distancia_milhas), 4)             AS media,
+    ROUND(STDDEV_SAMP(distancia_milhas), 4)     AS desvio_padrao,
+    MIN(distancia_milhas)                       AS minimo,
+    ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (
+        ORDER BY distancia_milhas)::NUMERIC, 2) AS q1_25pct,
+    ROUND(PERCENTILE_CONT(0.50) WITHIN GROUP (
+        ORDER BY distancia_milhas)::NUMERIC, 2) AS mediana_50pct,
+    ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (
+        ORDER BY distancia_milhas)::NUMERIC, 2) AS q3_75pct,
+    MAX(distancia_milhas)                       AS maximo
+FROM trusted.viagens;
+```
+
+**Leitura dos números.** A distribuição é fortemente assimétrica à direita: a
+média (3,57 mi) é quase o dobro da mediana (1,91 mi), e o desvio padrão (4,49)
+supera a própria média. Isso descreve bem a operação de táxi em Nova York —
+metade das corridas fica abaixo de 2 milhas, típico de deslocamento dentro de
+Manhattan, enquanto uma minoria de corridas longas para aeroportos e fora da
+cidade estica a cauda.
+
+O intervalo interquartil vai de 1,15 a 3,60 milhas: **metade de todas as
+corridas do ano cabe nessa faixa estreita de pouco mais de 2 milhas**.
+
+`PERCENTILE_CONT` foi usado em vez de `PERCENTILE_DISC` porque interpola entre
+valores adjacentes, que é a definição contínua de quartil e a mesma adotada pelo
+`pandas.describe()` — assim os números são diretamente comparáveis a uma análise
+exploratória feita em Python.
 
 ---
 
@@ -308,7 +480,51 @@ passou a detectar o formato pelos **magic bytes** em vez de confiar na extensão
 tratando os dois casos — se os arquivos forem recomprimidos no futuro, o
 pipeline continua funcionando.
 
-### 4. PostgreSQL não funciona em bind mount do Windows
+### 4. Disco cheio no `C:` derrubando a máquina, e corrompendo o banco
+
+O sintoma era brutal: a máquina travava por completo durante a carga, três vezes.
+O log de eventos do Windows deu o diagnóstico:
+
+```
+volmgr 161:       Dump file creation failed... BugCheckProgress
+Kernel-Power 41:  system rebooted without cleanly shutting down
+Volsnap 36:       shadow copies aborted — shadow copy storage could not grow
+```
+
+Não era falta de memória, como parecia a princípio: era **falta de disco**. O
+disco virtual do Docker (`docker_data.vhdx`) havia crescido para **34 GB**,
+deixando o `C:` com 10,8 GB livres. Sem espaço, o WSL2 não consegue expandir o
+disco, o Windows não consegue crescer o shadow copy, e o sistema derruba tudo —
+nem o dump de memória coube.
+
+O agravante: o VHDX **cresce mas nunca encolhe**. Três execuções acumularam
+espaço morto que nunca foi devolvido ao sistema — o Docker reportava 22 GB em
+uso, num arquivo de 34 GB.
+
+Na última queda o banco corrompeu de vez:
+
+```
+ERROR: invalid page in block 647931 of relation base/16384/32781
+```
+
+**Solução:** mover o armazenamento do Docker para o `D:`, que tem 490 GB livres,
+via `DataFolder` no `settings-store.json`. O `C:` voltou de 10,8 GB para 44,7 GB
+livres. Diferente da tentativa com bind mount descrita no item 5, aqui o que
+muda de lugar é o **arquivo do disco virtual**, e não o diretório de dados do
+Postgres — o banco continua enxergando um ext4 legítimo dentro do VHDX, com as
+garantias POSIX que ele exige.
+
+Junto disso, o `max_wal_size` do Postgres foi reduzido de 4 GB para 1 GB.
+O valor alto espaçava os checkpoints e acelerava a ingestão, mas mantinha até
+4 GB de WAL em disco entre eles, contribuindo para o esgotamento.
+
+> Detalhe de implementação que custou uma tentativa: gravar o
+> `settings-store.json` com `Set-Content -Encoding UTF8` no Windows PowerShell
+> 5.1 insere um BOM, e o parser do Docker rejeita o arquivo com
+> `invalid character 'ï' looking for beginning of value`. É preciso gravar sem
+> BOM, via `UTF8Encoding($false)`.
+
+### 5. PostgreSQL não funciona em bind mount do Windows
 
 Uma versão inicial apontava o diretório de dados do warehouse para o drive `D:`,
 buscando espaço livre. O banco caía no meio da carga:

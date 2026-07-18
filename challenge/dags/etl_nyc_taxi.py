@@ -228,6 +228,58 @@ def _executar_sql(caminho_sql: str) -> None:
     hook.run(arquivo.read_text(encoding="utf-8"), autocommit=True)
 
 
+def carregar_mes_em_trusted(nome_arquivo: str) -> int:
+    """Aplica limpeza e validacao em um mes, carregando-o na camada trusted.
+
+    A camada trusted e populada em lotes mensais, e nao em uma unica consulta
+    sobre os ~39,6M registros da raw. Cada lote confirma sua propria transacao,
+    de modo que uma interrupcao custa um mes de trabalho e nao o ano inteiro,
+    e o pico de memoria fica em um doze avos.
+
+    Parameters
+    ----------
+    nome_arquivo : str
+        Nome do arquivo de origem, usado para filtrar a raw e garantir
+        idempotencia.
+
+    Returns
+    -------
+    int
+        Quantidade de linhas inseridas na camada trusted para este mes.
+    """
+    caminho_sql = Path("/opt/airflow/sql/03_trusted_insert.sql")
+    if not caminho_sql.is_file():
+        raise FileNotFoundError(f"SQL nao encontrado: {caminho_sql}")
+
+    hook = PostgresHook(postgres_conn_id=CONEXAO_WAREHOUSE)
+    conexao = hook.get_conn()
+
+    try:
+        with conexao.cursor() as cursor:
+            cursor.execute(
+                caminho_sql.read_text(encoding="utf-8"),
+                {"arquivo_origem": nome_arquivo},
+            )
+            linhas_inseridas = cursor.rowcount
+        conexao.commit()
+    except Exception:
+        conexao.rollback()
+        logger.exception(
+            "Falha ao construir a trusted de %s; transacao revertida.",
+            nome_arquivo,
+        )
+        raise
+    finally:
+        conexao.close()
+
+    logger.info(
+        "Camada trusted: %d linhas validadas a partir de %s",
+        linhas_inseridas,
+        nome_arquivo,
+    )
+    return linhas_inseridas
+
+
 # --------------------------------------------------------------------------- #
 # Definicao da DAG
 # --------------------------------------------------------------------------- #
@@ -367,9 +419,9 @@ def etl_nyc_taxi() -> None:
         """
         return carregar_parquet_em_raw(caminho_parquet)
 
-    @task(task_id="construir_camada_trusted")
-    def construir_camada_trusted(contagens: list[int]) -> int:
-        """Constroi a camada trusted a partir da raw, aplicando as validacoes.
+    @task(task_id="criar_camada_trusted")
+    def criar_camada_trusted(contagens: list[int]) -> int:
+        """Cria a tabela vazia da camada trusted, pronta para a carga mensal.
 
         Parameters
         ----------
@@ -381,16 +433,51 @@ def etl_nyc_taxi() -> None:
         Returns
         -------
         int
-            Quantidade de linhas resultante na camada trusted.
+            Total de linhas ingerido na camada raw.
         """
         total_raw = sum(contagens)
         logger.info("Total ingerido na camada raw: %d linhas", total_raw)
 
-        _executar_sql("/opt/airflow/sql/03_trusted.sql")
+        _executar_sql("/opt/airflow/sql/03_trusted_ddl.sql")
+        return total_raw
 
-        hook = PostgresHook(postgres_conn_id=CONEXAO_WAREHOUSE)
-        total_trusted = hook.get_first("SELECT COUNT(*) FROM trusted.viagens")[0]
+    @task(task_id="carregar_trusted")
+    def carregar_trusted(nome_arquivo: str) -> int:
+        """Valida e carrega um mes na camada trusted.
 
+        Wrapper fino sobre :func:`carregar_mes_em_trusted`.
+
+        Parameters
+        ----------
+        nome_arquivo : str
+            Nome do arquivo de origem correspondente ao mes.
+
+        Returns
+        -------
+        int
+            Quantidade de linhas inseridas na camada trusted.
+        """
+        return carregar_mes_em_trusted(nome_arquivo)
+
+    @task(task_id="finalizar_camada_trusted")
+    def finalizar_camada_trusted(contagens_trusted: list[int], total_raw: int) -> int:
+        """Cria os indices analiticos e registra a taxa de descarte da limpeza.
+
+        Parameters
+        ----------
+        contagens_trusted : list[int]
+            Linhas validadas por mes.
+        total_raw : int
+            Total de linhas da camada raw, usado para calcular o descarte.
+
+        Returns
+        -------
+        int
+            Quantidade total de linhas da camada trusted.
+        """
+        _executar_sql("/opt/airflow/sql/03_trusted_indices.sql")
+
+        total_trusted = sum(contagens_trusted)
         descartados = total_raw - total_trusted
         percentual = (descartados / total_raw * 100) if total_raw else 0.0
         logger.info(
@@ -432,12 +519,21 @@ def etl_nyc_taxi() -> None:
     # expand() cria uma task de extracao e uma de carga por mes, executadas com
     # o paralelismo definido em max_active_tasks.
     arquivos = extrair_arquivo.expand(mes=MESES)
-    linhas_por_mes = carregar_raw.expand(caminho_parquet=arquivos)
+    linhas_raw = carregar_raw.expand(caminho_parquet=arquivos)
 
     # A tabela precisa existir antes de qualquer carga.
     tabela_raw >> arquivos
 
-    total_trusted = construir_camada_trusted(linhas_por_mes)
+    # A camada trusted segue o mesmo padrao: tabela vazia, uma task de carga por
+    # mes e, so entao, os indices. Doze transacoes curtas em vez de uma unica de
+    # mais de meia hora sobre 39,6M linhas.
+    total_raw = criar_camada_trusted(linhas_raw)
+    nomes_arquivos = [_nome_arquivo(mes) for mes in MESES]
+    linhas_trusted = carregar_trusted.expand(nome_arquivo=nomes_arquivos)
+
+    total_raw >> linhas_trusted
+
+    total_trusted = finalizar_camada_trusted(linhas_trusted, total_raw)
     construir_camada_refined(total_trusted)
 
 
