@@ -1,0 +1,42 @@
+[project]
+name = "nyc-taxi-etl"
+version = "1.0.0"
+description = "ETL das corridas de taxi de Nova York — desafio Datarisk"
+requires-python = ">=3.10"
+
+# Configuracao do Ruff versionada junto do codigo: sem isso, cada pessoa roda o
+# linter com um conjunto de regras diferente e o padrao vira negociacao.
+[tool.ruff]
+line-length = 88          # Um numero, nao um intervalo. Padrao do Ruff e do Black.
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle — PEP 8
+    "F",        # pyflakes — erros reais (import nao usado, variavel indefinida)
+    "I",        # isort — ordenacao de imports
+    "UP",       # pyupgrade — sintaxe moderna (list[int] em vez de List[int])
+    "B",        # flake8-bugbear — armadilhas comuns (default mutavel, etc.)
+    "SIM",      # flake8-simplify
+    "G",        # flake8-logging-format — proibe f-string em log
+    "LOG",      # regras de logging — proibe uso do logger raiz
+    "TRY",      # tryceratops — tratamento de excecoes
+    "RUF",      # regras proprias do Ruff
+]
+
+ignore = [
+    # TRY003 desencoraja mensagens descritivas fora da classe de excecao,
+    # exigindo uma subclasse por tipo de erro. Para um projeto deste porte isso
+    # troca clareza por cerimonia: `raise ValueError(f"Mes invalido: {mes}")`
+    # informa mais a quem le o traceback do que uma classe MesInvalidoError
+    # vazia. Regra desativada de forma consciente.
+    "TRY003",
+]
+
+[tool.ruff.lint.pydocstyle]
+# Docstrings no padrao NumPy, conforme o guia de estilo do projeto.
+convention = "numpy"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

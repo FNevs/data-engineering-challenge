@@ -1,0 +1,172 @@
+# Stack do desafio de Engenharia de Dados da Datarisk.
+#
+# Decisao de arquitetura: o docker-compose oficial do Airflow sobe 8 servicos
+# usando CeleryExecutor (webserver, scheduler, triggerer, worker, flower, redis,
+# postgres e init). Para uma carga batch em maquina unica isso adiciona custo de
+# memoria sem ganho algum, entao aqui usamos LocalExecutor, que paraleliza tasks
+# em subprocessos do proprio scheduler e dispensa Redis e workers.
+#
+# Os dois Postgres sao deliberadamente separados: misturar o banco operacional do
+# Airflow com o data warehouse acopla o ciclo de vida dos dois e e um antipadrao.
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres-airflow:5432/${AIRFLOW_DB_NAME}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # Paralelismo contido: a carga e limitada por I/O de disco e memoria, nao por
+    # CPU. Rodar os 12 meses simultaneamente estouraria a RAM da maquina.
+    AIRFLOW__CORE__PARALLELISM: 4
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: 3
+    # Conexao com o warehouse, consumida pelo PostgresHook nas tasks.
+    AIRFLOW_CONN_WAREHOUSE: postgresql://${WAREHOUSE_DB_USER}:${WAREHOUSE_DB_PASSWORD}@postgres-warehouse:5432/${WAREHOUSE_DB_NAME}
+    PYTHONWARNINGS: ignore::DeprecationWarning
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./sql:/opt/airflow/sql
+    - ./data:/opt/airflow/data
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    postgres-airflow:
+      condition: service_healthy
+    postgres-warehouse:
+      condition: service_healthy
+
+services:
+  # Banco de metadados do Airflow. Sem volume nomeado exposto ao host: o estado
+  # de orquestracao e descartavel e pode ser reconstruido com `airflow db init`.
+  postgres-airflow:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+    volumes:
+      - postgres-airflow-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER} -d ${AIRFLOW_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Data warehouse: aqui vivem as camadas raw, trusted e refined.
+  postgres-warehouse:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${WAREHOUSE_DB_USER}
+      POSTGRES_PASSWORD: ${WAREHOUSE_DB_PASSWORD}
+      POSTGRES_DB: ${WAREHOUSE_DB_NAME}
+    ports:
+      # Exposto para permitir inspecao via DBeaver/psql a partir do host.
+      - "5433:5432"
+    volumes:
+      - postgres-warehouse-data:/var/lib/postgresql/data
+      - ./sql/init:/docker-entrypoint-initdb.d
+    command:
+      # Tuning para carga em lote de ~39M linhas numa maquina de 16 GB.
+      #
+      # max_wal_size foi reduzido de 4GB para 1GB de proposito. O valor alto
+      # espacava os checkpoints e acelerava a ingestao, mas deixava ate 4 GB de
+      # WAL em disco entre eles. Somado ao crescimento das tabelas, isso ajudou
+      # a esgotar o disco e derrubar a maquina. Checkpoints mais frequentes
+      # custam um pouco de throughput e devolvem previsibilidade de espaco.
+      - postgres
+      - -c
+      - max_wal_size=1GB
+      - -c
+      - min_wal_size=256MB
+      - -c
+      - checkpoint_timeout=10min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - shared_buffers=768MB
+      - -c
+      - work_mem=64MB
+      - -c
+      - maintenance_work_mem=512MB
+      - -c
+      - synchronous_commit=off
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${WAREHOUSE_DB_USER} -d ${WAREHOUSE_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Executa migracoes e cria o usuario admin. Roda uma vez e encerra.
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "${_AIRFLOW_WWW_USER_USERNAME}" \
+          --password "${_AIRFLOW_WWW_USER_PASSWORD}" \
+          --firstname Filipe --lastname Datarisk \
+          --role Admin --email admin@example.com || true
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+    depends_on: *airflow-common-depends-on
+    restart: on-failure
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  postgres-airflow-data:
+  # Volume nomeado, deliberadamente.
+  #
+  # A primeira versao deste arquivo apontava o diretorio de dados para um bind
+  # mount em D:, buscando o espaco livre do disco secundario. Isso derruba o
+  # Postgres: no WSL2 os drives do Windows sao expostos via 9p/drvfs, que nao
+  # entrega as garantias POSIX exigidas pelo banco. Na pratica, a carga em massa
+  # falhava com
+  #
+  #     could not extend file ... with FileFallocate(): Interrupted system call
+  #     PANIC: could not write to file "pg_wal/xlogtemp": Interrupted system call
+  #
+  # e o servidor abortava com signal 6 no meio da ingestao. Volume nomeado
+  # mantem os dados no ext4 do VHDX do WSL2, onde fallocate e fsync se comportam
+  # como o Postgres espera.
+  postgres-warehouse-data:
